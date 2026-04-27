@@ -1,11 +1,12 @@
 """
-Google Calendar integration — read existing schedule, create events for tasks,
-and adjust dynamically.
+Google Calendar integration.
 
 Authentication: OAuth 2.0 with token caching (google_token.json).
-First run requires browser flow — after that it's automatic.
+First run opens a browser for auth — subsequent runs are automatic.
 """
+import json
 import logging
+import os
 from datetime import date, datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -20,17 +21,11 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Duration defaults per category (minutes)
 CATEGORY_DURATION: dict[str, int] = {
-    "gym": 75,
-    "diet": 20,
-    "job": 60,
-    "ai_income": 90,
-    "habit": 15,
-    "other": 30,
+    "gym": 75, "diet": 20, "job": 60,
+    "ai_income": 90, "habit": 15, "other": 30,
 }
 
-# Color IDs per task tier (Google Calendar color IDs 1-11)
 TIER_COLOR: dict[str, str] = {
     "gold": "5",    # Banana yellow
     "silver": "7",  # Peacock blue
@@ -38,11 +33,11 @@ TIER_COLOR: dict[str, str] = {
 }
 
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
 def _get_credentials() -> Optional[Credentials]:
-    """Load or refresh OAuth credentials. Returns None on failure."""
     creds = None
 
-    if config.GOOGLE_TOKEN_FILE and __import__("os").path.exists(config.GOOGLE_TOKEN_FILE):
+    if os.path.exists(config.GOOGLE_TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(config.GOOGLE_TOKEN_FILE, config.GOOGLE_SCOPES)
 
     if creds and creds.valid:
@@ -56,7 +51,6 @@ def _get_credentials() -> Optional[Credentials]:
         except Exception as exc:
             logger.warning("Token refresh failed: %s", exc)
 
-    # Need fresh auth — only works if a browser is available
     try:
         flow = InstalledAppFlow.from_client_secrets_file(
             config.GOOGLE_CREDENTIALS_FILE, config.GOOGLE_SCOPES
@@ -70,7 +64,6 @@ def _get_credentials() -> Optional[Credentials]:
 
 
 def _save_token(creds: Credentials) -> None:
-    import json
     with open(config.GOOGLE_TOKEN_FILE, "w") as f:
         f.write(creds.to_json())
 
@@ -78,33 +71,25 @@ def _save_token(creds: Credentials) -> None:
 def _build_service():
     creds = _get_credentials()
     if creds is None:
-        raise RuntimeError("Google Calendar: no valid credentials available.")
+        raise RuntimeError("Google Calendar: no valid credentials.")
     return build("calendar", "v3", credentials=creds)
 
 
-# ── Core helpers ──────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _make_datetime(date_str: str, time_str: str, tz: ZoneInfo) -> datetime:
-    """Parse a YYYY-MM-DD + HH:MM pair into a tz-aware datetime."""
-    dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-    return dt.replace(tzinfo=tz)
+    return datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
 
 
 def _event_body(
-    summary: str,
-    start: datetime,
-    end: datetime,
-    description: str = "",
-    color_id: Optional[str] = None,
+    summary: str, start: datetime, end: datetime,
+    description: str = "", color_id: Optional[str] = None,
 ) -> dict:
     body = {
         "summary": summary,
         "description": description,
         "start": {"dateTime": start.isoformat(), "timeZone": config.TIMEZONE},
-        "end": {"dateTime": end.isoformat(), "timeZone": config.TIMEZONE},
-        "reminders": {
-            "useDefault": False,
-            "overrides": [{"method": "popup", "minutes": 10}],
-        },
+        "end":   {"dateTime": end.isoformat(),   "timeZone": config.TIMEZONE},
+        "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 10}]},
     }
     if color_id:
         body["colorId"] = color_id
@@ -113,43 +98,30 @@ def _event_body(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 async def get_todays_events() -> list[dict]:
-    """Return all calendar events for today, sorted by start time."""
     tz = ZoneInfo(config.TIMEZONE)
     today = date.today()
-    start_of_day = datetime(today.year, today.month, today.day, 0, 0, tzinfo=tz)
-    end_of_day = start_of_day + timedelta(days=1)
+    start = datetime(today.year, today.month, today.day, tzinfo=tz)
+    end = start + timedelta(days=1)
 
     try:
         service = _build_service()
         result = (
             service.events()
-            .list(
-                calendarId=config.GOOGLE_CALENDAR_ID,
-                timeMin=start_of_day.isoformat(),
-                timeMax=end_of_day.isoformat(),
-                singleEvents=True,
-                orderBy="startTime",
-            )
+            .list(calendarId=config.GOOGLE_CALENDAR_ID,
+                  timeMin=start.isoformat(), timeMax=end.isoformat(),
+                  singleEvents=True, orderBy="startTime")
             .execute()
         )
         return result.get("items", [])
-    except HttpError as exc:
+    except (HttpError, RuntimeError) as exc:
         logger.error("Calendar fetch failed: %s", exc)
-        return []
-    except RuntimeError as exc:
-        logger.warning("Calendar not configured: %s", exc)
         return []
 
 
 async def create_event(
-    summary: str,
-    date_str: str,
-    start_time: str,
-    duration_minutes: int,
-    description: str = "",
-    color_id: Optional[str] = None,
+    summary: str, date_str: str, start_time: str, duration_minutes: int,
+    description: str = "", color_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Create a single calendar event. Returns the event ID or None."""
     tz = ZoneInfo(config.TIMEZONE)
     start = _make_datetime(date_str, start_time, tz)
     end = start + timedelta(minutes=duration_minutes)
@@ -158,111 +130,49 @@ async def create_event(
         service = _build_service()
         event = (
             service.events()
-            .insert(
-                calendarId=config.GOOGLE_CALENDAR_ID,
-                body=_event_body(summary, start, end, description, color_id),
-            )
+            .insert(calendarId=config.GOOGLE_CALENDAR_ID,
+                    body=_event_body(summary, start, end, description, color_id))
             .execute()
         )
         logger.info("Calendar event created: %s (%s)", summary, event["id"])
         return event["id"]
-    except HttpError as exc:
+    except (HttpError, RuntimeError) as exc:
         logger.error("Event creation failed: %s", exc)
-        return None
-    except RuntimeError as exc:
-        logger.warning("Calendar not configured: %s", exc)
         return None
 
 
 async def sync_tasks_to_calendar(tasks: list[dict]) -> None:
-    """
-    Create calendar events for a list of task dicts.
-    Each task must have: description, tier, category, scheduled_time.
-    """
     today_str = date.today().isoformat()
-
     for task in tasks:
-        scheduled_time = task.get("scheduled_time")
-        if not scheduled_time:
-            continue  # Only create events for time-scheduled tasks
-
-        category = task.get("category", "other")
-        tier = task.get("tier", "bronze")
-        duration = CATEGORY_DURATION.get(category, 30)
-        color_id = TIER_COLOR.get(tier)
-
-        summary = f"[{tier.upper()}] {task['description']}"
-        description = task.get("rationale", "")
-
+        if not task.get("scheduled_time"):
+            continue
         await create_event(
-            summary=summary,
+            summary=f"[{task.get('tier','?').upper()}] {task['description']}",
             date_str=today_str,
-            start_time=scheduled_time,
-            duration_minutes=duration,
-            description=description,
-            color_id=color_id,
+            start_time=task["scheduled_time"],
+            duration_minutes=CATEGORY_DURATION.get(task.get("category", "other"), 30),
+            description=task.get("rationale", ""),
+            color_id=TIER_COLOR.get(task.get("tier", "bronze")),
         )
 
 
 async def create_recurring_events() -> None:
-    """
-    Create standard weekly events:
-    - Morning workout block (Mon/Wed/Fri 07:00)
-    - Job search block (Mon–Fri 10:00)
-    - AI income work (Mon–Fri 14:00)
-    - Evening review (daily 21:00)
-    """
     today_str = date.today().isoformat()
-    tz = ZoneInfo(config.TIMEZONE)
-    today = date.today()
-    weekday = today.weekday()  # 0=Mon
+    weekday = date.today().weekday()  # 0=Mon
 
-    events_to_create = []
-
-    # Gym days: Mon(0), Wed(2), Fri(4)
+    events = []
     if weekday in (0, 2, 4):
-        events_to_create.append({
-            "summary": "[GOLD] Morning Gym",
-            "start_time": "07:00",
-            "duration": 75,
-            "color_id": "5",
-        })
-
-    # Job search: Mon–Fri
+        events.append({"summary": "[GOLD] Morning Gym",       "start": "07:00", "dur": 75,  "color": "5"})
     if weekday < 5:
-        events_to_create.append({
-            "summary": "[SILVER] Job Search Block",
-            "start_time": "10:00",
-            "duration": 60,
-            "color_id": "7",
-        })
-        events_to_create.append({
-            "summary": "[SILVER] AI Income Work",
-            "start_time": "14:00",
-            "duration": 90,
-            "color_id": "7",
-        })
+        events.append({"summary": "[SILVER] Job Search Block", "start": "10:00", "dur": 60,  "color": "7"})
+        events.append({"summary": "[SILVER] AI Income Work",   "start": "14:00", "dur": 90,  "color": "7"})
+    events.append(    {"summary": "[BRONZE] Evening Review",   "start": "21:00", "dur": 20,  "color": "8"})
 
-    # Evening review: every day
-    events_to_create.append({
-        "summary": "[BRONZE] Evening Review",
-        "start_time": "21:00",
-        "duration": 20,
-        "color_id": "8",
-    })
-
-    for ev in events_to_create:
-        await create_event(
-            summary=ev["summary"],
-            date_str=today_str,
-            start_time=ev["start_time"],
-            duration_minutes=ev["duration"],
-            color_id=ev.get("color_id"),
-        )
+    for ev in events:
+        await create_event(ev["summary"], today_str, ev["start"], ev["dur"], color_id=ev["color"])
 
 
 async def reschedule_event(event_id: str, new_start_time: str) -> bool:
-    """Move an existing event to a new start time (same day, same duration)."""
     tz = ZoneInfo(config.TIMEZONE)
     today_str = date.today().isoformat()
 
@@ -273,15 +183,13 @@ async def reschedule_event(event_id: str, new_start_time: str) -> bool:
         ).execute()
 
         old_start = datetime.fromisoformat(event["start"]["dateTime"])
-        old_end = datetime.fromisoformat(event["end"]["dateTime"])
-        duration = old_end - old_start
-
+        old_end   = datetime.fromisoformat(event["end"]["dateTime"])
+        duration  = old_end - old_start
         new_start = _make_datetime(today_str, new_start_time, tz)
-        new_end = new_start + duration
+        new_end   = new_start + duration
 
         event["start"] = {"dateTime": new_start.isoformat(), "timeZone": config.TIMEZONE}
-        event["end"] = {"dateTime": new_end.isoformat(), "timeZone": config.TIMEZONE}
-
+        event["end"]   = {"dateTime": new_end.isoformat(),   "timeZone": config.TIMEZONE}
         service.events().update(
             calendarId=config.GOOGLE_CALENDAR_ID, eventId=event_id, body=event
         ).execute()
